@@ -1,0 +1,114 @@
+#!/bin/sh
+
+# help
+if [ -z "${1}" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo "Convert VirtualBox .ova files to libvirt .qcow2"
+    echo "With automatic compression."
+    echo "Will add a tag named SOURCE_FILE_PLACEHOLDER."
+    echo "That can be used to insert the disks location."
+    echo ""
+    echo "Usage: ova2qcow <input_file.ova>"
+    exit 0
+fi
+
+# must run as normal user
+if [ "$(id -u)" = 0 ]; then
+    echo 'This script must be run as a normal user, not root!' >&2
+    exit 1
+fi
+
+# variables
+INFILE="$1"
+NAME=$(echo "$INFILE" | sed 's|.ova||g')
+PATH_TEMP="$NAME"_tmp
+OUT_DIR=$(dirname "$NAME")
+TMP_XML_NAME=$(basename "$NAME")
+TMP_XML="$PATH_TEMP/$TMP_XML_NAME.xml"
+
+if [ ! -f "$INFILE" ]; then
+    echo "There is no file like that."
+    exit 1
+fi
+
+if ! echo "$INFILE" | grep -q ".ova"; then
+    echo "File must end in .ova"
+    exit 1
+fi
+
+if [ -f "$NAME.xml" ]; then
+    echo "Already Converted"
+    exit 0
+fi
+
+# test if virtualbox is running
+if [ -z "$(command -v vboxmanage)" ]; then
+    VBOX_IS_RUNNING=$(vboxmanage list runningvms)
+    if [ -n "$VBOX_IS_RUNNING" ]; then
+        echo "VirtualBox must be stopped before conversion"
+        exit 1
+    fi
+fi
+
+# convert
+echo "Converting..."
+# check if the output folder already exist and is not empty
+if [ -d "$PATH_TEMP" ] && [ -n "$(ls -A "$PATH_TEMP")" ]; then
+    echo "Skipping, $PATH_TEMP already exists"
+else
+    # convert
+    mkdir -p "$PATH_TEMP" || exit 1
+    virt-v2v -i ova "$INFILE" -o disk -of qcow2 -n default -oa sparse \
+        -os "$PATH_TEMP"
+    RESULT=$?
+    if [ "$RESULT" = 1 ]; then
+        echo "FAILED CONVERSION"
+        echo "Command is: virt-v2v -i ova $INFILE -o disk -of qcow2" \
+            " -n default -oa sparse -os $PATH_TEMP"
+        echo "HINT: Don't run VirtualBox and KVM at the same time"
+        exit 1
+    fi
+fi
+
+# extract XML file
+if [ -f "$TMP_XML" ]; then
+    echo "Converting XML..."
+    # rename disk xpath value
+    XML_DISK_XPATH="domain/devices/disk/source/@file"
+    XML_DISKS=$(xmlstarlet sel -t -v "$XML_DISK_XPATH" "$TMP_XML")
+    XML_DISK=$(basename "$XML_DISKS")
+    XML_DISK_NEW="VM_PATH_PLACEHOLDER$XML_DISK.qcow2"
+    xmlstarlet ed -L -u "$XML_DISK_XPATH" \
+        -v "$XML_DISK_NEW" "$TMP_XML" || exit 1
+    # move the xml out
+    mv "$TMP_XML" "$OUT_DIR" || exit 1
+else
+    echo "Skipping, $TMP_XML does not exist"
+fi
+
+# compress
+echo "Compressing..."
+for f in "$PATH_TEMP"/*; do
+    [ -e "$f" ] || continue
+    DISK_OLD=$(basename "$f")
+    DISK_NEW="$DISK_OLD.qcow2"
+    echo "Disk is: $DISK_OLD"
+    if [ -f "$DISK_NEW" ]; then
+        echo "Skipping, disk $DISK_NEW already exists"
+    else
+        virt-sparsify --convert qcow2 --check-tmpdir=fail \
+            --compress "$f" "$f.qcow2" || exit 1
+        wait
+        # move new disk
+        mv "$f.qcow2" "$OUT_DIR" || exit 1
+        # remove old disk
+        rm -f "$f" || exit 1
+    fi
+done
+
+# cleanup
+TEMP_DIR_STATUS=$(ls -A "$PATH_TEMP")
+if [ -z "$TEMP_DIR_STATUS" ]; then
+    rmdir "$PATH_TEMP" || exit 1
+else
+    echo "$PATH_TEMP is not empty, please check"
+fi
